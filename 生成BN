@@ -1,0 +1,140 @@
+#生成BN
+import pandas as pd
+from pathlib import Path
+import pyagrum as gum
+
+# =========================================================
+# 1. Config
+# =========================================================
+
+seed = 42
+
+n_nodes = 20          # 节点数 M
+edge_ratio = 4       # 平均入边数 E，对应总边数约为 M * E
+gpop_ss = 10000       # 总体样本量 |P|
+
+exp_name = "6"
+
+train_ss = 500        # 训练集 T
+ref_ss = 5000         # 参考集 R
+test_ss = 2000        # 测试集 Q
+
+# 输出目录
+base_path = Path("outputs")
+bns_path = base_path / "bns"
+data_path = base_path / "data"
+dags_path = base_path / "dags"
+splits_path = base_path / "splits"
+
+bns_path.mkdir(parents=True, exist_ok=True)
+data_path.mkdir(parents=True, exist_ok=True)
+dags_path.mkdir(parents=True, exist_ok=True)
+splits_path.mkdir(parents=True, exist_ok=True)
+
+
+# =========================================================
+# 2. Set seed
+# =========================================================
+
+gum.initRandom(seed)
+
+
+# =========================================================
+# 3. Generate random BN
+#    (close to the author's generate_randombn style)
+# =========================================================
+
+bn_gen = gum.BNGenerator()
+bn = bn_gen.generate(
+    n_nodes=n_nodes,
+    n_arcs=int(n_nodes * edge_ratio),
+    n_modmax=2   # binary variables
+)
+
+# Save BN as .bif
+gum.saveBN(bn, str(bns_path / f"{exp_name}.bif"))
+
+
+# =========================================================
+# 4. Extract and save DAG structure
+# =========================================================
+
+edges = []
+for arc in bn.arcs():
+    src = bn.variable(arc[0]).name()
+    dst = bn.variable(arc[1]).name()
+    edges.append((src, dst))
+
+edges_df = pd.DataFrame(edges, columns=["source", "target"])
+edges_df.to_csv(dags_path / f"{exp_name}_edges.csv", index=False)
+
+
+# =========================================================
+# 5. Save simple metadata
+# =========================================================
+
+meta = {
+    "exp_name": exp_name,
+    "seed": seed,
+    "n_nodes": len(list(bn.nodes())),
+    "n_arcs": len(list(bn.arcs())),
+    "complexity": bn.dim(),
+    "gpop_ss": gpop_ss,
+    "train_ss": train_ss,
+    "ref_ss": ref_ss,
+    "test_ss": test_ss,
+}
+
+meta_df = pd.DataFrame([meta])
+meta_df.to_csv(dags_path / f"{exp_name}_meta.csv", index=False)
+
+
+# =========================================================
+# 6. Generate population data P from BN
+#    (close to the author's code)
+# =========================================================
+
+data_gen = gum.BNDatabaseGenerator(bn)
+data_gen.drawSamples(gpop_ss)
+data_gen.setDiscretizedLabelModeRandom()
+
+gpop = data_gen.to_pandas()
+
+# 给总体样本添加原始编号列
+gpop = gpop.reset_index().rename(columns={"index": "row_id"})
+
+# 保存总体样本文件 P（保留 row_id）
+gpop.to_csv(data_path / f"{exp_name}.csv", index=False)
+
+
+# =========================================================
+# 6.1 Split P into T / R / Q
+# =========================================================
+
+total_need = train_ss + ref_ss + test_ss
+if total_need > len(gpop):
+    raise ValueError(
+        f"T + R + Q = {total_need} 超过了总体样本量 P = {len(gpop)}，请调整样本量设置"
+    )
+
+# 从总体样本 P 中无放回抽样
+# 注意：这里不要 drop 原始 row_id
+sampled = gpop.sample(n=total_need, random_state=seed).copy()
+
+# 顺序切分，但不要 reset_index(drop=True)
+train_df = sampled.iloc[:train_ss].copy()                         # T
+ref_df = sampled.iloc[train_ss:train_ss + ref_ss].copy()         # R
+test_df = sampled.iloc[train_ss + ref_ss:].copy()                # Q
+
+# 如需显示整齐，可只重排行号，不影响 row_id 列
+train_df = train_df.reset_index(drop=True)
+ref_df = ref_df.reset_index(drop=True)
+test_df = test_df.reset_index(drop=True)
+
+# 保存划分结果（保留 row_id）
+split_exp_path = splits_path / exp_name
+split_exp_path.mkdir(parents=True, exist_ok=True)
+
+train_df.to_csv(split_exp_path / "train_T.csv", index=False)
+ref_df.to_csv(split_exp_path / "ref_R.csv", index=False)
+test_df.to_csv(split_exp_path / "test_Q.csv", index=False)
