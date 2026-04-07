@@ -1,0 +1,502 @@
+import os
+from pathlib import Path
+
+JOBLIB_TEMP = Path(r"D:\joblib_temp")
+JOBLIB_TEMP.mkdir(parents=True, exist_ok=True)
+
+os.environ["JOBLIB_TEMP_FOLDER"] = str(JOBLIB_TEMP)
+os.environ["TEMP"] = str(JOBLIB_TEMP)
+os.environ["TMP"] = str(JOBLIB_TEMP)
+
+print("JOBLIB_TEMP_FOLDER =", os.environ["JOBLIB_TEMP_FOLDER"])
+# =========================================================
+# 10. Run posterior inferences on Q
+#     for gt / learned BN / noisy BN / CN
+#     CPU multiprocessing version
+# =========================================================
+
+import os
+import math
+import random
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from joblib import Parallel, delayed
+
+infer_path = base_path / "inference"
+infer_path.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------
+# 10.1 Paths and basic info
+# ---------------------------------------------------------
+
+test_path = splits_path / exp_name / "test_Q.csv"
+train_path = splits_path / exp_name / "train_T.csv"
+
+gt_bn_path = bns_path / f"{exp_name}.bif"
+learned_bn_path = models_path / f"{exp_name}_bn_from_T.bif"
+noisy_bn_path = models_path / f"{exp_name}_noisy_bn_eps{eps}.bif"
+
+test_df = pd.read_csv(test_path)
+all_cols = list(test_df.columns)
+
+print("\n开始在测试集 Q 上生成查询并做推断...")
+print("测试集路径:", test_path)
+print("测试集大小:", len(test_df))
+
+# ---------------------------------------------------------
+# 10.2 Helpers for BN inference
+# ---------------------------------------------------------
+
+def posterior_prob_bn(bn_model, target_var, target_val, evidence):
+    ie = gum.LazyPropagation(bn_model)
+    ie.setEvidence(evidence)
+    ie.makeInference()
+    post = ie.posterior(target_var)
+    return float(post[target_val])
+
+
+def map_state_bn(bn_model, target_var, evidence):
+    ie = gum.LazyPropagation(bn_model)
+    ie.setEvidence(evidence)
+    ie.makeInference()
+    post = ie.posterior(target_var)
+    arr = np.array(post[:], dtype=float)
+    return int(np.argmax(arr)), float(np.max(arr))
+
+
+# ---------------------------------------------------------
+# 10.3 Helper: build one query from one row in Q
+# ---------------------------------------------------------
+
+def sample_query_from_row(row, columns, rng, min_evi=1, max_evi=3):
+    target_var = rng.choice(columns)
+
+    candidate_evi = [c for c in columns if c != target_var]
+    max_evi = min(max_evi, len(candidate_evi))
+    n_evi = rng.randint(min_evi, max_evi)
+
+    evidence_vars = rng.sample(candidate_evi, n_evi)
+    evidence = {v: int(row[v]) for v in evidence_vars}
+
+    target_val = int(row[target_var])
+
+    return target_var, target_val, evidence_vars, evidence
+
+
+# ---------------------------------------------------------
+# 10.4 CN interval by Monte Carlo sampling
+# ---------------------------------------------------------
+
+def posterior_interval_cn_mc(
+    cn,
+    target_var,
+    target_val,
+    evidence,
+    max_iter=500,
+    max_time=20,
+    epsilon=1e-4,
+):
+    ie = gum.CNMonteCarloSampling(cn)
+    ie.setEvidence(evidence)
+
+    ie.setMaxIter(max_iter)
+    ie.setMaxTime(max_time)
+    ie.setEpsilon(epsilon)
+
+    ie.makeInference()
+
+    lower_dist = ie.marginalMin(target_var)
+    upper_dist = ie.marginalMax(target_var)
+
+    lower = float(lower_dist[target_val])
+    upper = float(upper_dist[target_val])
+
+    return lower, upper
+
+
+# ---------------------------------------------------------
+# 10.5 Build all query specs in main process
+# ---------------------------------------------------------
+
+n_queries = min(1000, len(test_df))
+rng = random.Random(seed)
+
+query_specs = []
+
+for qid in range(n_queries):
+    row_idx = rng.randrange(len(test_df))
+    row = test_df.iloc[row_idx]
+
+    target_var, target_val, evidence_vars, evidence = sample_query_from_row(
+        row=row,
+        columns=all_cols,
+        rng=rng,
+        min_evi=1,
+        max_evi=3
+    )
+
+    query_specs.append({
+        "query_id": qid,
+        "row_id": int(row_idx),
+        "target_var": target_var,
+        "target_val": int(target_val),
+        "evidence_vars": evidence_vars,
+        "evidence": evidence,
+    })
+
+print("已生成查询数:", len(query_specs))
+
+
+# ---------------------------------------------------------
+# 10.6 Split queries into chunks
+# ---------------------------------------------------------
+
+def chunk_list(lst, chunk_size):
+    for i in range(0, len(lst), chunk_size):
+        yield lst[i:i + chunk_size]
+
+
+# 你可以手动改这两个参数
+N_JOBS = max(1, os.cpu_count() - 1)   # 例如改成 4、8
+CHUNK_SIZE = 50                       # 每个进程一次处理多少条 query
+
+query_chunks = list(chunk_list(query_specs, CHUNK_SIZE))
+
+print("CPU 核数:", os.cpu_count())
+print("并行进程数:", N_JOBS)
+print("分块数:", len(query_chunks))
+print("每块 query 数:", CHUNK_SIZE)
+
+
+# ---------------------------------------------------------
+# 10.7 Worker: each process loads models once, then handles a chunk
+# ---------------------------------------------------------
+
+def run_query_chunk(
+    chunk,
+    gt_bn_path_str,
+    learned_bn_path_str,
+    noisy_bn_path_str,
+    train_path_str,
+    ess,
+    max_iter,
+    max_time,
+    epsilon,
+):
+    import pyagrum as gum
+    import pandas as pd
+    import numpy as np
+
+    # ---- local helpers inside worker ----
+    def posterior_prob_bn_local(bn_model, target_var, target_val, evidence):
+        ie = gum.LazyPropagation(bn_model)
+        ie.setEvidence(evidence)
+        ie.makeInference()
+        post = ie.posterior(target_var)
+        return float(post[target_val])
+
+    def map_state_bn_local(bn_model, target_var, evidence):
+        ie = gum.LazyPropagation(bn_model)
+        ie.setEvidence(evidence)
+        ie.makeInference()
+        post = ie.posterior(target_var)
+        arr = np.array(post[:], dtype=float)
+        return int(np.argmax(arr)), float(np.max(arr))
+
+    def posterior_interval_cn_mc_local(
+        cn,
+        target_var,
+        target_val,
+        evidence,
+        max_iter,
+        max_time,
+        epsilon,
+    ):
+        ie = gum.CNMonteCarloSampling(cn)
+        ie.setEvidence(evidence)
+        ie.setMaxIter(max_iter)
+        ie.setMaxTime(max_time)
+        ie.setEpsilon(epsilon)
+        ie.makeInference()
+
+        lower_dist = ie.marginalMin(target_var)
+        upper_dist = ie.marginalMax(target_var)
+
+        lower = float(lower_dist[target_val])
+        upper = float(upper_dist[target_val])
+        return lower, upper
+
+    # 这里依赖你前面已经定义过 add_counts_to_bn
+    # 在 joblib 子进程里，notebook 顶层定义通常是可见的
+    # 如果报 add_counts_to_bn 未定义，就把它也复制到这个 worker 里
+
+    # ---- load models once per process call ----
+    gt_bn = gum.loadBN(gt_bn_path_str)
+    learned_bn = gum.loadBN(learned_bn_path_str)
+    noisy_bn = gum.loadBN(noisy_bn_path_str)
+
+    train_df_local = pd.read_csv(train_path_str)
+    bn_copy = gum.BayesNet(learned_bn)
+    add_counts_to_bn(bn_copy, train_df_local)
+
+    cn = gum.CredalNet(bn_copy)
+    cn.idmLearning(ess)
+
+    local_results = []
+
+    for q in chunk:
+        qid = q["query_id"]
+        row_idx = q["row_id"]
+        target_var = q["target_var"]
+        target_val = q["target_val"]
+        evidence_vars = q["evidence_vars"]
+        evidence = q["evidence"]
+
+        # --- true posterior from ground-truth BN
+        gt_prob = posterior_prob_bn_local(gt_bn, target_var, target_val, evidence)
+        gt_map, gt_map_prob = map_state_bn_local(gt_bn, target_var, evidence)
+
+        # --- learned BN
+        bn_prob = posterior_prob_bn_local(learned_bn, target_var, target_val, evidence)
+        bn_map, bn_map_prob = map_state_bn_local(learned_bn, target_var, evidence)
+
+        # --- noisy BN
+        noisy_prob = posterior_prob_bn_local(noisy_bn, target_var, target_val, evidence)
+        noisy_map, noisy_map_prob = map_state_bn_local(noisy_bn, target_var, evidence)
+
+        # --- CN interval
+        cn_lower, cn_upper = posterior_interval_cn_mc_local(
+            cn=cn,
+            target_var=target_var,
+            target_val=target_val,
+            evidence=evidence,
+            max_iter=max_iter,
+            max_time=max_time,
+            epsilon=epsilon,
+        )
+        cn_mid = 0.5 * (cn_lower + cn_upper)
+
+        local_results.append({
+            "query_id": qid,
+            "row_id": row_idx,
+            "target_var": target_var,
+            "target_val": target_val,
+            "evidence_vars": "|".join(evidence_vars),
+            "evidence_vals": "|".join([str(evidence[v]) for v in evidence_vars]),
+
+            "gt_prob": gt_prob,
+            "gt_map": gt_map,
+            "gt_map_prob": gt_map_prob,
+
+            "bn_prob": bn_prob,
+            "bn_map": bn_map,
+            "bn_map_prob": bn_map_prob,
+
+            "noisy_prob": noisy_prob,
+            "noisy_map": noisy_map,
+            "noisy_map_prob": noisy_map_prob,
+
+            "cn_lower": cn_lower,
+            "cn_upper": cn_upper,
+            "cn_mid": cn_mid,
+            "cn_width": cn_upper - cn_lower,
+            "cn_contains_gt": int(cn_lower <= gt_prob <= cn_upper),
+        })
+
+    return local_results
+
+
+# ---------------------------------------------------------
+# 10.8 Run parallel
+# ---------------------------------------------------------
+
+MAX_ITER = 1000
+MAX_TIME = 20
+EPSILON = 1e-4
+
+chunk_results = Parallel(
+    n_jobs=N_JOBS,
+    backend="loky",
+    verbose=10,
+    temp_folder=str(JOBLIB_TEMP),
+    max_nbytes=None,
+)(
+    delayed(run_query_chunk)(
+        chunk=chunk,
+        gt_bn_path_str=str(gt_bn_path),
+        learned_bn_path_str=str(learned_bn_path),
+        noisy_bn_path_str=str(noisy_bn_path),
+        train_path_str=str(train_path),
+        ess=ess,
+        max_iter=MAX_ITER,
+        max_time=MAX_TIME,
+        epsilon=EPSILON,
+    )
+    for chunk in query_chunks
+)
+
+# flatten
+results = [row for chunk in chunk_results for row in chunk]
+
+# sort by query_id
+results = sorted(results, key=lambda x: x["query_id"])
+
+infer_df = pd.DataFrame(results)
+
+infer_file = infer_path / f"{exp_name}_inference_results.csv"
+infer_df.to_csv(infer_file, index=False)
+
+print("推断结果文件:", infer_file)
+print("查询数:", len(infer_df))
+display(infer_df.head())
+
+# =========================================================
+# 11. Compute utility metrics from inference results
+# =========================================================
+
+metrics_path = base_path / "metrics"
+metrics_path.mkdir(parents=True, exist_ok=True)
+
+infer_file = infer_path / f"{exp_name}_inference_results.csv"
+infer_df = pd.read_csv(infer_file)
+
+print("\n开始计算效用指标...")
+print("推断结果文件:", infer_file)
+print("查询数:", len(infer_df))
+
+
+# ---------------------------------------------------------
+# 11.1 MAE
+# ---------------------------------------------------------
+
+# BN / noisy BN：直接用点后验
+mae_bn = np.mean(np.abs(infer_df["bn_prob"] - infer_df["gt_prob"]))
+mae_noisy = np.mean(np.abs(infer_df["noisy_prob"] - infer_df["gt_prob"]))
+
+# CN：按文档，用区间中点作为代表点预测
+if "cn_mid" not in infer_df.columns:
+    infer_df["cn_mid"] = 0.5 * (infer_df["cn_lower"] + infer_df["cn_upper"])
+
+mae_cn = np.mean(np.abs(infer_df["cn_mid"] - infer_df["gt_prob"]))
+
+
+# ---------------------------------------------------------
+# 11.2 Coverage
+# ---------------------------------------------------------
+
+coverage_cn = np.mean(
+    (infer_df["gt_prob"] >= infer_df["cn_lower"]) &
+    (infer_df["gt_prob"] <= infer_df["cn_upper"])
+)
+
+
+# ---------------------------------------------------------
+# 11.3 Width
+# ---------------------------------------------------------
+
+if "cn_width" not in infer_df.columns:
+    infer_df["cn_width"] = infer_df["cn_upper"] - infer_df["cn_lower"]
+
+width_cn = infer_df["cn_width"].mean()
+
+
+# ---------------------------------------------------------
+# 11.4 ICE (Interval Calibration Error)
+#     按 cn_mid 分箱
+# ---------------------------------------------------------
+
+def compute_ice(df, n_bins=10):
+    """
+    ICE:
+    1. 按 CN 区间中点 cn_mid 分箱
+    2. 每个箱内计算：
+       - 平均预测区间 [avg_lower, avg_upper]
+       - 平均真实后验 avg_gt
+    3. 若 avg_gt 落在 [avg_lower, avg_upper] 内，偏差 = 0
+       否则偏差 = 到区间最近端点的距离
+    4. 整体 ICE = 分箱偏差的加权平均
+    """
+    work = df.copy()
+
+    # 避免 pd.cut 在重复边界时报错
+    work["bin"] = pd.cut(
+        work["cn_mid"],
+        bins=n_bins,
+        labels=False,
+        include_lowest=True,
+        duplicates="drop"
+    )
+
+    total_n = len(work)
+    ice = 0.0
+    bin_details = []
+
+    for b, grp in work.groupby("bin", dropna=True):
+        if len(grp) == 0:
+            continue
+
+        avg_lower = grp["cn_lower"].mean()
+        avg_upper = grp["cn_upper"].mean()
+        avg_gt = grp["gt_prob"].mean()
+
+        if avg_gt < avg_lower:
+            dev = avg_lower - avg_gt
+        elif avg_gt > avg_upper:
+            dev = avg_gt - avg_upper
+        else:
+            dev = 0.0
+
+        weight = len(grp) / total_n
+        ice += weight * dev
+
+        bin_details.append({
+            "bin": int(b),
+            "count": len(grp),
+            "avg_cn_mid": grp["cn_mid"].mean(),
+            "avg_cn_lower": avg_lower,
+            "avg_cn_upper": avg_upper,
+            "avg_gt_prob": avg_gt,
+            "bin_dev": dev,
+            "weight": weight,
+            "weighted_dev": weight * dev,
+        })
+
+    bin_df = pd.DataFrame(bin_details)
+    return ice, bin_df
+
+
+ice_cn, ice_bins_df = compute_ice(infer_df, n_bins=10)
+
+
+# ---------------------------------------------------------
+# 11.5 Save summary metrics
+# ---------------------------------------------------------
+
+metrics_summary = pd.DataFrame([{
+    "exp_name": exp_name,
+    "n_queries": len(infer_df),
+
+    "MAE_BN": mae_bn,
+    "MAE_noisy_BN": mae_noisy,
+    "MAE_CN_mid": mae_cn,
+
+    "Coverage_CN": coverage_cn,
+    "ICE_CN": ice_cn,
+    "Width_CN": width_cn,
+}])
+
+metrics_file = metrics_path / f"{exp_name}_metrics_summary.csv"
+metrics_summary.to_csv(metrics_file, index=False)
+
+ice_bins_file = metrics_path / f"{exp_name}_ice_bins.csv"
+ice_bins_df.to_csv(ice_bins_file, index=False)
+
+print("指标汇总文件:", metrics_file)
+print("ICE 分箱文件:", ice_bins_file)
+
+print("\n=== Utility Metrics Summary ===")
+display(metrics_summary)
+
+print("\n=== ICE Bin Details (head) ===")
+display(ice_bins_df.head())
