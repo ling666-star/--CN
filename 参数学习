@@ -136,24 +136,76 @@ def are_all_bns_different(bn_vec) -> None:
     print(f"({len(signatures)}/{len(bn_vec)} different BNs.)")
 
 
-# Add counts of events to a BN
+
+
 def add_counts_to_bn(bn_in, data):
-    for node in bn_in.names():
-        var = bn_in.variable(node)
-        parents = bn_in.parents(node)
-        parent_names = [bn_in.variable(p).name() for p in parents]
+    """
+    Add empirical event counts from data to a BN.
 
-        shape = [bn_in.variable(p).domainSize() for p in parents] + [var.domainSize()]
-        counts_array = np.zeros(shape, dtype=float)
+    Important:
+    - This function only changes CPT values.
+    - It does NOT add/remove arcs.
+    - After this function, bn_in.cpt(node) stores counts, not probabilities.
+    - It writes CPT cells by variable-name assignment, so it avoids
+      parent-order / flatten-order mismatch.
+    """
 
-        for _, row in data.iterrows():
+    # 检查 data 是否包含所有 BN 变量列
+    missing_cols = set(bn_in.names()) - set(data.columns)
+    if missing_cols:
+        raise ValueError(f"data 缺少 BN 变量列: {missing_cols}")
+
+    # 先把所有 CPT 清零
+    for node_name in bn_in.names():
+        bn_in.cpt(node_name).fillWith(0.0)
+
+    # 逐行统计 counts
+    for _, row in data.iterrows():
+
+        for node_name in bn_in.names():
+            node_id = bn_in.idFromName(node_name)
+            node_var = bn_in.variable(node_id)
+
             try:
-                key = tuple([int(row[p]) for p in parent_names] + [int(row[node])])
-                counts_array[key] += 1.0
-            except KeyError:
+                node_val = int(row[node_name])
+            except Exception:
                 continue
 
-        bn_in.cpt(node).fillWith(counts_array.flatten().tolist())
+            # 检查当前节点状态是否合法
+            if node_val < 0 or node_val >= node_var.domainSize():
+                continue
+
+            assign = {
+                node_name: node_val
+            }
+
+            valid = True
+
+            # 父节点赋值
+            for parent_id in bn_in.parents(node_id):
+                parent_name = bn_in.variable(parent_id).name()
+                parent_var = bn_in.variable(parent_id)
+
+                try:
+                    parent_val = int(row[parent_name])
+                except Exception:
+                    valid = False
+                    break
+
+                if parent_val < 0 or parent_val >= parent_var.domainSize():
+                    valid = False
+                    break
+
+                assign[parent_name] = parent_val
+
+            if not valid:
+                continue
+
+            # 关键：按变量名写入，不用 flatten
+            bn_in.cpt(node_name)[assign] += 1.0
+
+    return bn_in
+
 
 
 # Create noisy BN by adding Laplacian noise
@@ -186,7 +238,7 @@ def get_noisy_bn(bn_in, scale: float):
 # 9.1 Experiment settings for model learning
 # ---------------------------------------------------------
 
-ess = 100      # CN 的 IDM 超参数
+ess = 100    # CN 的 IDM 超参数
 eps = 0.05    # noisy BN 的隐私/噪声强度参数
 
 # 模型输出目录
@@ -197,6 +249,12 @@ models_path.mkdir(parents=True, exist_ok=True)
 train_path = splits_path / exp_name / "train_T.csv"
 train_df = pd.read_csv(train_path)
 
+bn_var_names = list(bn.names())
+
+train_model_df = train_df[bn_var_names].copy()
+
+train_model_path = splits_path / exp_name / "train_T_model.csv"
+train_model_df.to_csv(train_model_path, index=False)
 print("\n开始从训练集 T 学习模型...")
 print("训练集路径:", train_path)
 print("训练集大小:", len(train_df))
@@ -210,9 +268,29 @@ print("训练集大小:", len(train_df))
 train_path = splits_path / exp_name / "train_T.csv"
 train_df = pd.read_csv(train_path)
 
-bn_learner = gum.BNLearner(str(train_path))
+# 去掉 row_id，只保留 BN 变量列
+train_model_df = train_df.drop(columns=["row_id"], errors="ignore")
+
+# 检查变量是否完全一致
+missing_cols = set(bn.names()) - set(train_model_df.columns)
+extra_cols = set(train_model_df.columns) - set(bn.names())
+
+if missing_cols:
+    raise ValueError(f"训练集缺少 BN 变量: {missing_cols}")
+
+if extra_cols:
+    raise ValueError(f"训练集有额外变量: {extra_cols}")
+
+# 按 BN 变量顺序排列列，避免顺序错位
+train_model_df = train_model_df[list(bn.names())]
+
+# 保存一个专门用于学习的干净训练集
+train_model_path = models_path / f"{exp_name}_train_T_for_learning.csv"
+train_model_df.to_csv(train_model_path, index=False)
+
+bn_learner = gum.BNLearner(str(train_model_path))
 bn_learner.useSmoothingPrior(1e-5)
-bn_learned = bn_learner.learnParameters(bn.dag())
+bn_learned = bn_learner.learnParameters(bn)
 
 learned_bn_path = models_path / f"{exp_name}_bn_from_T.bif"
 gum.saveBN(bn_learned, str(learned_bn_path))
@@ -225,7 +303,67 @@ print("已保存 learned BN:", learned_bn_path)
 # ---------------------------------------------------------
 
 bn_copy = gum.BayesNet(bn_learned)
-add_counts_to_bn(bn_copy, train_df)
+add_counts_to_bn(bn_copy, train_model_df)
+
+from itertools import product
+
+def check_counts_for_node(bn_counts, data, target):
+    """
+    检查 add_counts_to_bn 写入 bn_counts 的 counts 是否和 pandas 直接统计一致。
+    """
+
+    target_id = bn_counts.idFromName(target)
+    parent_ids = list(bn_counts.parents(target_id))
+    parent_names = [bn_counts.variable(pid).name() for pid in parent_ids]
+
+    print(f"\n检查 counts: {target} | {parent_names}")
+
+    parent_domains = [
+        range(bn_counts.variable(pid).domainSize())
+        for pid in parent_ids
+    ]
+
+    target_domain = range(bn_counts.variable(target_id).domainSize())
+
+    all_ok = True
+
+    for parent_vals in product(*parent_domains):
+        parent_assign = dict(zip(parent_names, parent_vals))
+
+        for target_val in target_domain:
+            assign = dict(parent_assign)
+            assign[target] = target_val
+
+            # pyAgrum CPT 里的 count
+            gum_count = float(bn_counts.cpt(target)[assign])
+
+            # pandas 直接统计的 count
+            mask = data[target].astype(int).eq(target_val)
+            for p, v in parent_assign.items():
+                mask = mask & data[p].astype(int).eq(v)
+
+            pd_count = float(mask.sum())
+
+            if abs(gum_count - pd_count) > 1e-9:
+                all_ok = False
+                print("不一致:")
+                print("assign =", assign)
+                print("gum_count =", gum_count)
+                print("pd_count  =", pd_count)
+
+    if all_ok:
+        print(f"{target} counts 检查通过。")
+
+    return all_ok
+
+ok_x08 = check_counts_for_node(
+    bn_counts=bn_copy,
+    data=train_model_df,
+    target="X08"
+)
+
+if not ok_x08:
+    raise RuntimeError("X08 counts 写入错误，先不要继续 CN 学习。")
 
 cn = gum.CredalNet(bn_copy)
 cn.idmLearning(ess)
@@ -280,14 +418,14 @@ print("模型元信息文件:", model_meta_path)
 # 9.6 Optional: sample a few BNs from CN for sanity check
 # ---------------------------------------------------------
 
-cn_inside_samples = sample_from_cn(cn, n=3, where="inside")
-cn_vertex_samples = sample_from_cn(cn, n=3, where="outside")
+#cn_inside_samples = sample_from_cn(cn, n=3, where="inside")
+#cn_vertex_samples = sample_from_cn(cn, n=3, where="outside")
 
-print("\nCN 内部随机采样 BN 检查:")
-are_all_bns_different(cn_inside_samples)
+#print("\nCN 内部随机采样 BN 检查:")
+#are_all_bns_different(cn_inside_samples)
 
-print("CN 顶点随机采样 BN 检查:")
-are_all_bns_different(cn_vertex_samples)
+#print("CN 顶点随机采样 BN 检查:")
+#are_all_bns_different(cn_vertex_samples)
 
 
 # ---------------------------------------------------------
