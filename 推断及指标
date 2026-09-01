@@ -1,14 +1,17 @@
 import os
 from pathlib import Path
 
-JOBLIB_TEMP = Path(r"D:\joblib_temp")
+from pathlib import Path
+import os
+
+JOBLIB_TEMP = Path.home() / "joblib_temp"
 JOBLIB_TEMP.mkdir(parents=True, exist_ok=True)
 
+
 os.environ["JOBLIB_TEMP_FOLDER"] = str(JOBLIB_TEMP)
-os.environ["TEMP"] = str(JOBLIB_TEMP)
-os.environ["TMP"] = str(JOBLIB_TEMP)
 
 print("JOBLIB_TEMP_FOLDER =", os.environ["JOBLIB_TEMP_FOLDER"])
+print("临时文件夹路径:", JOBLIB_TEMP)
 # =========================================================
 # 10. Run posterior inferences on Q
 #     for gt / learned BN / noisy BN / CN
@@ -38,11 +41,22 @@ learned_bn_path = models_path / f"{exp_name}_bn_from_T.bif"
 noisy_bn_path = models_path / f"{exp_name}_noisy_bn_eps{eps}.bif"
 
 test_df = pd.read_csv(test_path)
-all_cols = list(test_df.columns)
+
+# 保留原始 test_df，用于查看 row_id
+# 但推断用的数据必须删掉 row_id
+test_model_df = test_df.drop(columns=["row_id"], errors="ignore").copy()
+
+
+all_cols = list(test_model_df.columns)
+
+print("测试集路径:", test_path)
+print("原始测试集大小:", test_df.shape)
+print("推断用测试集大小:", test_model_df.shape)
+print("推断用测试集是否还有 row_id:", "row_id" in test_model_df.columns)
 
 print("\n开始在测试集 Q 上生成查询并做推断...")
 print("测试集路径:", test_path)
-print("测试集大小:", len(test_df))
+print("测试集大小:", len(test_model_df))
 
 # ---------------------------------------------------------
 # 10.2 Helpers for BN inference
@@ -119,14 +133,14 @@ def posterior_interval_cn_mc(
 # 10.5 Build all query specs in main process
 # ---------------------------------------------------------
 
-n_queries = min(1000, len(test_df))
+n_queries = min(500, len(test_model_df))
 rng = random.Random(seed)
 
 query_specs = []
 
 for qid in range(n_queries):
-    row_idx = rng.randrange(len(test_df))
-    row = test_df.iloc[row_idx]
+    row_idx = rng.randrange(len(test_model_df))
+    row = test_model_df.iloc[row_idx]
 
     target_var, target_val, evidence_vars, evidence = sample_query_from_row(
         row=row,
@@ -157,8 +171,8 @@ def chunk_list(lst, chunk_size):
         yield lst[i:i + chunk_size]
 
 
-# 你可以手动改这两个参数
-N_JOBS = max(1, os.cpu_count() - 1)   # 例如改成 4、8
+
+N_JOBS = 16   
 CHUNK_SIZE = 50                       # 每个进程一次处理多少条 query
 
 query_chunks = list(chunk_list(query_specs, CHUNK_SIZE))
@@ -227,10 +241,6 @@ def run_query_chunk(
         upper = float(upper_dist[target_val])
         return lower, upper
 
-    # 这里依赖你前面已经定义过 add_counts_to_bn
-    # 在 joblib 子进程里，notebook 顶层定义通常是可见的
-    # 如果报 add_counts_to_bn 未定义，就把它也复制到这个 worker 里
-
     # ---- load models once per process call ----
     gt_bn = gum.loadBN(gt_bn_path_str)
     learned_bn = gum.loadBN(learned_bn_path_str)
@@ -275,6 +285,8 @@ def run_query_chunk(
             max_time=max_time,
             epsilon=epsilon,
         )
+        if cn_lower > cn_upper:
+            cn_lower, cn_upper = cn_upper, cn_lower
         cn_mid = 0.5 * (cn_lower + cn_upper)
 
         local_results.append({
@@ -311,7 +323,7 @@ def run_query_chunk(
 # 10.8 Run parallel
 # ---------------------------------------------------------
 
-MAX_ITER = 1000
+MAX_ITER = 500
 MAX_TIME = 20
 EPSILON = 1e-4
 
@@ -350,153 +362,3 @@ infer_df.to_csv(infer_file, index=False)
 print("推断结果文件:", infer_file)
 print("查询数:", len(infer_df))
 display(infer_df.head())
-
-# =========================================================
-# 11. Compute utility metrics from inference results
-# =========================================================
-
-metrics_path = base_path / "metrics"
-metrics_path.mkdir(parents=True, exist_ok=True)
-
-infer_file = infer_path / f"{exp_name}_inference_results.csv"
-infer_df = pd.read_csv(infer_file)
-
-print("\n开始计算效用指标...")
-print("推断结果文件:", infer_file)
-print("查询数:", len(infer_df))
-
-
-# ---------------------------------------------------------
-# 11.1 MAE
-# ---------------------------------------------------------
-
-# BN / noisy BN：直接用点后验
-mae_bn = np.mean(np.abs(infer_df["bn_prob"] - infer_df["gt_prob"]))
-mae_noisy = np.mean(np.abs(infer_df["noisy_prob"] - infer_df["gt_prob"]))
-
-# CN：按文档，用区间中点作为代表点预测
-if "cn_mid" not in infer_df.columns:
-    infer_df["cn_mid"] = 0.5 * (infer_df["cn_lower"] + infer_df["cn_upper"])
-
-mae_cn = np.mean(np.abs(infer_df["cn_mid"] - infer_df["gt_prob"]))
-
-
-# ---------------------------------------------------------
-# 11.2 Coverage
-# ---------------------------------------------------------
-
-coverage_cn = np.mean(
-    (infer_df["gt_prob"] >= infer_df["cn_lower"]) &
-    (infer_df["gt_prob"] <= infer_df["cn_upper"])
-)
-
-
-# ---------------------------------------------------------
-# 11.3 Width
-# ---------------------------------------------------------
-
-if "cn_width" not in infer_df.columns:
-    infer_df["cn_width"] = infer_df["cn_upper"] - infer_df["cn_lower"]
-
-width_cn = infer_df["cn_width"].mean()
-
-
-# ---------------------------------------------------------
-# 11.4 ICE (Interval Calibration Error)
-#     按 cn_mid 分箱
-# ---------------------------------------------------------
-
-def compute_ice(df, n_bins=10):
-    """
-    ICE:
-    1. 按 CN 区间中点 cn_mid 分箱
-    2. 每个箱内计算：
-       - 平均预测区间 [avg_lower, avg_upper]
-       - 平均真实后验 avg_gt
-    3. 若 avg_gt 落在 [avg_lower, avg_upper] 内，偏差 = 0
-       否则偏差 = 到区间最近端点的距离
-    4. 整体 ICE = 分箱偏差的加权平均
-    """
-    work = df.copy()
-
-    # 避免 pd.cut 在重复边界时报错
-    work["bin"] = pd.cut(
-        work["cn_mid"],
-        bins=n_bins,
-        labels=False,
-        include_lowest=True,
-        duplicates="drop"
-    )
-
-    total_n = len(work)
-    ice = 0.0
-    bin_details = []
-
-    for b, grp in work.groupby("bin", dropna=True):
-        if len(grp) == 0:
-            continue
-
-        avg_lower = grp["cn_lower"].mean()
-        avg_upper = grp["cn_upper"].mean()
-        avg_gt = grp["gt_prob"].mean()
-
-        if avg_gt < avg_lower:
-            dev = avg_lower - avg_gt
-        elif avg_gt > avg_upper:
-            dev = avg_gt - avg_upper
-        else:
-            dev = 0.0
-
-        weight = len(grp) / total_n
-        ice += weight * dev
-
-        bin_details.append({
-            "bin": int(b),
-            "count": len(grp),
-            "avg_cn_mid": grp["cn_mid"].mean(),
-            "avg_cn_lower": avg_lower,
-            "avg_cn_upper": avg_upper,
-            "avg_gt_prob": avg_gt,
-            "bin_dev": dev,
-            "weight": weight,
-            "weighted_dev": weight * dev,
-        })
-
-    bin_df = pd.DataFrame(bin_details)
-    return ice, bin_df
-
-
-ice_cn, ice_bins_df = compute_ice(infer_df, n_bins=10)
-
-
-# ---------------------------------------------------------
-# 11.5 Save summary metrics
-# ---------------------------------------------------------
-
-metrics_summary = pd.DataFrame([{
-    "exp_name": exp_name,
-    "n_queries": len(infer_df),
-
-    "MAE_BN": mae_bn,
-    "MAE_noisy_BN": mae_noisy,
-    "MAE_CN_mid": mae_cn,
-
-    "Coverage_CN": coverage_cn,
-    "ICE_CN": ice_cn,
-    "Width_CN": width_cn,
-}])
-
-metrics_file = metrics_path / f"{exp_name}_metrics_summary.csv"
-metrics_summary.to_csv(metrics_file, index=False)
-
-ice_bins_file = metrics_path / f"{exp_name}_ice_bins.csv"
-ice_bins_df.to_csv(ice_bins_file, index=False)
-
-print("指标汇总文件:", metrics_file)
-print("ICE 分箱文件:", ice_bins_file)
-
-print("\n=== Utility Metrics Summary ===")
-display(metrics_summary)
-
-print("\n=== ICE Bin Details (head) ===")
-display(ice_bins_df.head())
