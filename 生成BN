@@ -1,3 +1,12 @@
+#相关库
+import os
+from pathlib import Path
+JOBLIB_TEMP = Path.home() / "joblib_temp"
+print(os.getcwd())
+import sys
+print(sys.executable)
+#%pip install pyagrum
+
 #生成BN
 import pandas as pd
 from pathlib import Path
@@ -9,11 +18,11 @@ import pyagrum as gum
 
 seed = 42
 
-n_nodes = 20          # 节点数 M
-edge_ratio = 4       # 平均入边数 E，对应总边数约为 M * E
+n_nodes = 50          # 节点数 M
+edge_ratio = 2       # 平均入边数 E，对应总边数约为 M * E
 gpop_ss = 10000       # 总体样本量 |P|
 
-exp_name = "6"
+exp_name = "8_0.05"
 
 train_ss = 500        # 训练集 T
 ref_ss = 5000         # 参考集 R
